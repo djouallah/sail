@@ -1,0 +1,87 @@
+name: bench wheels
+
+# Release-mode pysail wheels for djouallah/lakehouse_benchmark, built the same way for a
+# baseline and a patched ref so the two can be compared on the benchmark. Not part of any PR.
+#
+#   0.7.1.post1 = lakehq/sail main at b4b7836 (baseline)
+#   0.7.1.post2 = djouallah/sail feat/cache-loaded-tables (lakehq/sail#2629), on top of b4b7836
+#
+# Thin LTO and 16 codegen units instead of the release profile's fat LTO and 1 unit, so the build
+# fits a 4-core runner. Both wheels use the same settings.
+
+on:
+  push:
+    branches: [bench-wheels]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ref: b4b7836272d8b8069d178e0ec38714a39e8b5cd7
+            version: 0.7.1.post1
+          - ref: feat/cache-loaded-tables
+            version: 0.7.1.post2
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_LTO: thin
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.ref }}
+
+      - uses: ./.github/actions/adjust-swap-space
+      - uses: ./.github/actions/mount-target-directory
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ github.token }}
+
+      - run: rustup toolchain install stable --profile minimal && rustc -V
+
+      - name: Set package version
+        run: |
+          sed -i -E 's/^version = "[^"]+"/version = "${{ matrix.version }}"/' pyproject.toml
+          grep -n '^version' pyproject.toml
+          git log -1 --format='%H %s'
+
+      - name: Build wheel
+        run: |
+          pip install "maturin>=1.0,<2.0"
+          maturin build --release --out dist --interpreter python3.11 --compatibility linux
+          ls -la dist
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheel-${{ matrix.version }}
+          path: dist/*.whl
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          path: dist
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la dist
+          gh release view bench-wheels -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create bench-wheels -R "$GITHUB_REPOSITORY" --prerelease --target bench-wheels \
+              --title "bench wheels (not a Sail release)" \
+              --notes "Wheels for djouallah/lakehouse_benchmark only. 0.7.1.post1 = lakehq/sail main at b4b7836; 0.7.1.post2 = feat/cache-loaded-tables (lakehq/sail#2629). Thin LTO, linux x86_64."
+          gh release upload bench-wheels dist/*.whl -R "$GITHUB_REPOSITORY" --clobber
