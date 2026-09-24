@@ -48,6 +48,19 @@ impl CatalogManager {
             .await
     }
 
+    /// Like [`Self::resolve_lakehouse_table`], for a query that writes nothing,
+    /// so the result may come from the catalog table cache. Never use this for a write.
+    pub async fn resolve_lakehouse_table_for_read<T: AsRef<str>>(
+        &self,
+        table: &[T],
+        request: ResolveLakehouseTableRequest,
+    ) -> CatalogResult<LakehouseResolvedTable> {
+        let (provider, database, name) = self.resolve_object(table)?;
+        provider
+            .resolve_lakehouse_table_for_read(&database, &name, request)
+            .await
+    }
+
     pub async fn resolve_lakehouse_table_status<T: AsRef<str>>(
         &self,
         table: &[T],
@@ -86,6 +99,19 @@ impl CatalogManager {
     ) -> CatalogResult<TableAccessSession> {
         let (provider, database, name) = self.resolve_object(table)?;
         provider.begin_table_access(&database, &name, request).await
+    }
+
+    /// Like [`Self::begin_table_access`], for a query that writes nothing,
+    /// so the session may come from the catalog table cache. Never use this for a write.
+    pub async fn begin_table_access_for_read<T: AsRef<str>>(
+        &self,
+        table: &[T],
+        request: BeginTableAccessRequest,
+    ) -> CatalogResult<TableAccessSession> {
+        let (provider, database, name) = self.resolve_object(table)?;
+        provider
+            .begin_table_access_for_read(&database, &name, request)
+            .await
     }
 
     pub async fn plan_lakehouse_scan<T: AsRef<str>>(
@@ -194,6 +220,23 @@ impl CatalogManager {
         &self,
         reference: &[T],
     ) -> CatalogResult<TableStatus> {
+        self.get_table_or_view_impl(reference, false).await
+    }
+
+    /// Like [`Self::get_table_or_view`], for a query that writes nothing,
+    /// so the table status may come from the catalog table cache. Never use this for a write.
+    pub async fn get_table_or_view_for_read<T: AsRef<str>>(
+        &self,
+        reference: &[T],
+    ) -> CatalogResult<TableStatus> {
+        self.get_table_or_view_impl(reference, true).await
+    }
+
+    async fn get_table_or_view_impl<T: AsRef<str>>(
+        &self,
+        reference: &[T],
+        for_read: bool,
+    ) -> CatalogResult<TableStatus> {
         if let [name] = reference {
             match self.get_temporary_view(name.as_ref()).await {
                 Ok(x) => return Ok(x),
@@ -206,7 +249,13 @@ impl CatalogManager {
         {
             return self.get_global_temporary_view(name.as_ref()).await;
         }
-        match self.get_table(reference).await {
+        let table = if for_read {
+            let (provider, database, table) = self.resolve_object(reference)?;
+            provider.get_table_for_read(&database, &table).await
+        } else {
+            self.get_table(reference).await
+        };
+        match table {
             Ok(x) => return Ok(x),
             Err(CatalogError::NotFound(_, _)) => {}
             Err(e) => return Err(e),

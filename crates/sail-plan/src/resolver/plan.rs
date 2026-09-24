@@ -16,15 +16,16 @@ pub struct NamedPlan {
 impl PlanResolver<'_> {
     /// Resolves a plan into a named plan.
     pub async fn resolve_named_plan(&self, plan: spec::Plan) -> PlanResult<NamedPlan> {
-        let mut state = PlanResolverState::new();
         match plan {
             spec::Plan::Query(query) => {
+                let mut state = PlanResolverState::new_read_only();
                 let plan = self.resolve_query_plan(query, &mut state).await?;
                 let plan = Self::preserve_order_sensitive_aggregate_sorts(plan)?;
                 let fields = Some(Self::get_field_names(plan.schema(), &state)?);
                 Ok(NamedPlan { plan, fields })
             }
             spec::Plan::Command(command) => {
+                let mut state = PlanResolverState::new();
                 let plan = self.resolve_command_plan(command, &mut state).await?;
                 let plan = Self::preserve_order_sensitive_aggregate_sorts(plan)?;
                 Ok(NamedPlan { plan, fields: None })

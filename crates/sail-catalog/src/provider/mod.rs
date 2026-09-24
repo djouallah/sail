@@ -95,6 +95,17 @@ pub trait CatalogProvider: Send + Sync {
         ))
     }
 
+    /// Resolves a table for a query that writes nothing.
+    /// Unlike [`Self::resolve_lakehouse_table`], the result may come from a cache.
+    async fn resolve_lakehouse_table_for_read(
+        &self,
+        database: &Namespace,
+        table: &str,
+        request: ResolveLakehouseTableRequest,
+    ) -> CatalogResult<LakehouseResolvedTable> {
+        self.resolve_lakehouse_table(database, table, request).await
+    }
+
     async fn plan_lakehouse_create(
         &self,
         database: &Namespace,
@@ -122,6 +133,17 @@ pub trait CatalogProvider: Send + Sync {
         Err(CatalogError::UnsupportedCapability(
             "table access sessions".to_string(),
         ))
+    }
+
+    /// Begins table access for a query that writes nothing.
+    /// Unlike [`Self::begin_table_access`], the session may come from a cache.
+    async fn begin_table_access_for_read(
+        &self,
+        database: &Namespace,
+        table: &str,
+        request: BeginTableAccessRequest,
+    ) -> CatalogResult<TableAccessSession> {
+        self.begin_table_access(database, table, request).await
     }
 
     async fn plan_lakehouse_scan(
@@ -162,6 +184,16 @@ pub trait CatalogProvider: Send + Sync {
 
     /// Gets the status of a table in the catalog.
     async fn get_table(&self, database: &Namespace, table: &str) -> CatalogResult<TableStatus>;
+
+    /// Gets the status of a table for a query that writes nothing.
+    /// Unlike [`Self::get_table`], the result may come from a cache.
+    async fn get_table_for_read(
+        &self,
+        database: &Namespace,
+        table: &str,
+    ) -> CatalogResult<TableStatus> {
+        self.get_table(database, table).await
+    }
 
     /// Lists all tables in a database in the catalog.
     async fn list_tables(&self, database: &Namespace) -> CatalogResult<Vec<TableStatus>>;

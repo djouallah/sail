@@ -84,11 +84,15 @@ impl PlanResolver<'_> {
         }
 
         let reference: Vec<String> = name.clone().into();
-        let status = self
-            .ctx
-            .extension::<CatalogManager>()?
-            .get_table_or_view(&reference)
-            .await?;
+        // Only a query that writes nothing may read tables from the catalog table cache.
+        // `MERGE`, `UPDATE`, and `DELETE` read their target through here as well.
+        let read_only = state.is_read_only();
+        let manager = self.ctx.extension::<CatalogManager>()?;
+        let status = if read_only {
+            manager.get_table_or_view_for_read(&reference).await?
+        } else {
+            manager.get_table_or_view(&reference).await?
+        };
         let plan = match status.kind {
             TableKind::Table {
                 columns,
@@ -109,15 +113,22 @@ impl PlanResolver<'_> {
                     .await?;
                 let info = SourceInfo {
                     paths: location.map(|x| vec![x]).unwrap_or_default(),
-                    lakehouse_table: Some(
+                    lakehouse_table: Some(if read_only {
+                        self.resolve_lakehouse_table_context_for_read(
+                            &reference,
+                            Some(&format),
+                            vec![],
+                        )
+                        .await?
+                    } else {
                         self.resolve_lakehouse_table_context(
                             &reference,
                             LakehouseOperation::Read,
                             Some(&format),
                             vec![],
                         )
-                        .await?,
-                    ),
+                        .await?
+                    }),
                     schema: Some(schema),
                     constraints,
                     partition_by: partition_by.into_iter().map(|field| field.column).collect(),
