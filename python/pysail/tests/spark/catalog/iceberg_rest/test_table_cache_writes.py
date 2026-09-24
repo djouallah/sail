@@ -148,7 +148,7 @@ def test_create_table_as_select(cached: SparkSession, other: SparkSession) -> No
 @pytest.mark.parametrize("mode", list(ROW_LEVEL_MODES))
 def test_update(cached: SparkSession, other: SparkSession, mode: str) -> None:
     table = _cached_then_changed_elsewhere(cached, other, f"update_{mode.replace('-', '_')}", ROW_LEVEL_MODES[mode])
-    cached.sql(f"UPDATE {table} SET name = 'updated'")
+    cached.sql(f"UPDATE {table} SET name = 'updated'")  # noqa: S608
     assert _rows(other, table) == [(1, "updated"), (2, "updated")]
 
 
