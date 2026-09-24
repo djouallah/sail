@@ -95,6 +95,10 @@ pub(super) struct PlanResolverState {
     lambda_param_scopes: Vec<Vec<(String, Option<FieldRef>)>>,
     /// The named windows defined in the current query, keyed by window name.
     windows: HashMap<String, spec::Window>,
+    /// Whether the plan being resolved is a query that writes nothing. Only such a plan
+    /// may read tables from the catalog table cache, so a statement that writes always
+    /// plans against the current tables, including the tables it reads.
+    read_only: bool,
 }
 
 impl Default for PlanResolverState {
@@ -117,7 +121,20 @@ impl PlanResolverState {
             positional_param_values: Vec::new(),
             lambda_param_scopes: Vec::new(),
             windows: HashMap::new(),
+            read_only: false,
         }
+    }
+
+    /// A state for resolving a query that writes nothing.
+    pub fn new_read_only() -> Self {
+        Self {
+            read_only: true,
+            ..Self::new()
+        }
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     fn next_field_id(&mut self) -> String {

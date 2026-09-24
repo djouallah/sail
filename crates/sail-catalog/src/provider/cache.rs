@@ -47,10 +47,12 @@ const DEFAULT_LOADED_TABLE_TTL_SECS: u64 = 60;
 /// cache settings, so a remote catalog is not asked to load the same table again
 /// for every statement that references it.
 ///
-/// Only reads are served from the cache. Resolving a table for any other operation
-/// drops the cached entries for that table first, so writes always plan against the
-/// current table metadata. Commits, `ALTER TABLE`, `DROP TABLE`, and `CREATE TABLE`
-/// through Sail drop the cached entries for the table as well.
+/// The cache is only reached through the `*_for_read` methods, which the planner calls
+/// only for a query that writes nothing. `get_table`, `resolve_lakehouse_table`, and
+/// `begin_table_access` always go to the catalog, so a statement that writes never sees
+/// a cached table, not even for the tables it reads. Resolving a table for anything but
+/// a read drops its cached entries, and so do commits, `ALTER TABLE`, `DROP TABLE`, and
+/// `CREATE TABLE` through Sail.
 ///
 /// A load that was already in flight when an invalidation happened must not put its
 /// result back, since it may predate the change. Every invalidation bumps a generation
@@ -494,20 +496,27 @@ impl<P: CatalogProvider + ?Sized + 'static> CatalogProvider for CachingCatalogPr
         table: &str,
         request: ResolveLakehouseTableRequest,
     ) -> CatalogResult<LakehouseResolvedTable> {
-        let Some(c) = self.loaded_table_cache.as_ref() else {
-            return self
-                .inner
-                .resolve_lakehouse_table(database, table, request)
-                .await;
-        };
-        if request.operation != LakehouseOperation::Read {
-            // Anything but a read plans against the current table metadata.
+        if request.operation != LakehouseOperation::Read
+            && let Some(c) = self.loaded_table_cache.as_ref()
+        {
+            // A change is coming, so the cached table is about to be out of date.
             c.invalidate_table(database, table).await;
-            return self
-                .inner
-                .resolve_lakehouse_table(database, table, request)
-                .await;
         }
+        self.inner
+            .resolve_lakehouse_table(database, table, request)
+            .await
+    }
+
+    async fn resolve_lakehouse_table_for_read(
+        &self,
+        database: &Namespace,
+        table: &str,
+        request: ResolveLakehouseTableRequest,
+    ) -> CatalogResult<LakehouseResolvedTable> {
+        let c = match self.loaded_table_cache.as_ref() {
+            Some(c) if request.operation == LakehouseOperation::Read => c,
+            _ => return self.resolve_lakehouse_table(database, table, request).await,
+        };
         let key = (LoadedTableCache::key(database, table), request.clone());
         if let Some(v) = c.resolved.get(&key).await {
             return Ok(v);
@@ -539,6 +548,17 @@ impl<P: CatalogProvider + ?Sized + 'static> CatalogProvider for CachingCatalogPr
         table: &str,
         request: BeginTableAccessRequest,
     ) -> CatalogResult<TableAccessSession> {
+        self.inner
+            .begin_table_access(database, table, request)
+            .await
+    }
+
+    async fn begin_table_access_for_read(
+        &self,
+        database: &Namespace,
+        table: &str,
+        request: BeginTableAccessRequest,
+    ) -> CatalogResult<TableAccessSession> {
         let c = match self.loaded_table_cache.as_ref() {
             Some(c)
                 if matches!(
@@ -548,12 +568,7 @@ impl<P: CatalogProvider + ?Sized + 'static> CatalogProvider for CachingCatalogPr
             {
                 c
             }
-            _ => {
-                return self
-                    .inner
-                    .begin_table_access(database, table, request)
-                    .await;
-            }
+            _ => return self.begin_table_access(database, table, request).await,
         };
         let key = (LoadedTableCache::key(database, table), request.clone());
         if let Some(v) = c.access.get(&key).await {
@@ -618,6 +633,15 @@ impl<P: CatalogProvider + ?Sized + 'static> CatalogProvider for CachingCatalogPr
     }
 
     async fn get_table(&self, database: &Namespace, table: &str) -> CatalogResult<TableStatus> {
+        // Only a query that writes nothing may use the cache, through `get_table_for_read`.
+        self.inner.get_table(database, table).await
+    }
+
+    async fn get_table_for_read(
+        &self,
+        database: &Namespace,
+        table: &str,
+    ) -> CatalogResult<TableStatus> {
         if let Some(c) = self.loaded_table_cache.as_ref() {
             let key = LoadedTableCache::key(database, table);
             if let Some(v) = c.status.get(&key).await {
@@ -1377,9 +1401,38 @@ mod tests {
         }
     }
 
-    /// Loads a table the way the planner does for a read: get the table, resolve it,
-    /// and begin a table access session for it.
+    /// Loads a table the way the planner does for a query that writes nothing: get the
+    /// table, resolve it, and begin a table access session for it.
     async fn read_table<P: CatalogProvider + ?Sized + 'static>(
+        provider: &CachingCatalogProvider<P>,
+        ns: &Namespace,
+        table: &str,
+    ) {
+        provider.get_table_for_read(ns, table).await.unwrap();
+        let resolved = provider
+            .resolve_lakehouse_table_for_read(
+                ns,
+                table,
+                resolve_request(table, LakehouseOperation::Read),
+            )
+            .await
+            .unwrap();
+        provider
+            .begin_table_access_for_read(
+                ns,
+                table,
+                BeginTableAccessRequest {
+                    context: resolved.execution,
+                    purpose: TableAccessPurpose::DataRead,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Loads a table the way the planner does for a statement that writes, which reads
+    /// its tables, including the target, through the methods that never use the cache.
+    async fn load_table_for_write<P: CatalogProvider + ?Sized + 'static>(
         provider: &CachingCatalogProvider<P>,
         ns: &Namespace,
         table: &str,
@@ -1400,6 +1453,34 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_loaded_table_cache_never_serves_a_write() {
+        let mock = Arc::new(MockProvider::with_access_expiry(None));
+        let provider = CachingCatalogProvider::new(mock.clone(), loaded_table_cache_config(), None);
+        let ns = Namespace::try_from(vec!["db1"]).unwrap();
+        let get_table_calls = || mock.get_table_calls.load(Ordering::SeqCst);
+        let access_calls = || mock.access_calls.load(Ordering::SeqCst);
+
+        // A query that writes nothing caches the table.
+        read_table(&provider, &ns, "t1").await;
+        assert_eq!(get_table_calls(), 2);
+        assert_eq!(access_calls(), 1);
+
+        // A statement that writes loads the current table every time, even with the
+        // table in the cache and even for reading it.
+        load_table_for_write(&provider, &ns, "t1").await;
+        assert_eq!(get_table_calls(), 4);
+        assert_eq!(access_calls(), 2);
+        load_table_for_write(&provider, &ns, "t1").await;
+        assert_eq!(get_table_calls(), 6);
+        assert_eq!(access_calls(), 3);
+
+        // Loading a table for a write does not fill the cache either.
+        read_table(&provider, &ns, "t1").await;
+        assert_eq!(get_table_calls(), 6);
+        assert_eq!(access_calls(), 3);
     }
 
     #[tokio::test]
@@ -1426,7 +1507,7 @@ mod tests {
         assert_eq!(get_table_calls(), 4);
         assert_eq!(access_calls(), 2);
 
-        // Resolving a table for a write bypasses the cache and drops that table's entries.
+        // Resolving a table for a write drops that table's entries.
         provider
             .resolve_lakehouse_table(&ns, "t1", resolve_request("t1", LakehouseOperation::Write))
             .await
@@ -1436,10 +1517,10 @@ mod tests {
         assert_eq!(get_table_calls(), 7);
         assert_eq!(access_calls(), 3);
 
-        // A table access session for a write is never cached.
+        // A table access session for a write is never cached, even when asked for a read.
         for _ in 0..2 {
             provider
-                .begin_table_access(
+                .begin_table_access_for_read(
                     &ns,
                     "t1",
                     BeginTableAccessRequest {
